@@ -1,0 +1,1019 @@
+#!/usr/bin/env python
+
+# spline: sed(1)-like Python one-liners
+
+from __future__ import print_function, unicode_literals
+
+from argparse import ArgumentParser
+from collections import defaultdict
+from contextlib import contextmanager
+try:
+    from cStringIO import StringIO
+except ImportError:
+    from io import StringIO
+import ast
+import inspect
+import itertools
+import os
+import re
+import sys
+import textwrap
+import traceback
+
+
+# Some things in the generated code are slightly different for Python 3; use
+# this to tell the versions apart for what's currently running.
+PY2 = sys.version_info[0] < 3
+PYPY = sys.executable.endswith('pypy')
+
+EXEC_AS_FILENAME = '<spline>'
+
+
+class Unsupported(Exception):
+    """
+    An exception type for operations that are not supported in the current
+    environment (e.g., in Python 3 but not 2).
+    """
+    pass
+
+
+def _climb_attrs(node):
+    if isinstance(node, ast.Attribute):
+        parent = _climb_attrs(node.value)
+        if parent is None:
+            return None
+        return None if parent is None else parent + [node.attr]
+    elif isinstance(node, ast.Name):
+        return [node.id]
+    else:
+        return None
+
+
+def json_walk(obj, path=None):
+    path = path or []
+    if isinstance(obj, list):
+        for index, item in enumerate(obj):
+            for child in json_walk(item, path + [index]):
+                yield child
+    elif isinstance(obj, dict):
+        for key, value in obj.iteritems():
+            for child in json_walk(value, path + [key]):
+                yield child
+    else:
+        yield path, obj
+
+
+def tree_flatten(tree):
+    if not hasattr(tree, 'keys'):
+        return tree
+    if all(isinstance(key, int) for key in tree.keys()):
+        return [tree_flatten(value) for _, value in sorted(tree.items())]
+    else:
+        return {key: tree_flatten(value) for key, value in tree.items()}
+
+
+def json_unwalk(bits):
+    tree = lambda: defaultdict(tree)
+    root = tree()
+    for path, value in bits:
+        cur = root
+        for item in path[:-1]:
+            cur = cur[item]
+        cur[path[-1]] = value
+    return tree_flatten(root)
+
+
+def percentile(seq, pct):
+    seq = list(seq)
+    rank = pct/100.0 * (len(seq) + 1)
+    int_part = int(rank)
+    frac_part = rank - int_part
+    int_part = max(int_part - 1, 0)
+    return seq[int_part] + frac_part * (seq[int_part + 1] - seq[int_part])
+
+
+class Terminal(object):
+    def __init__(self, enabled):
+        self.enabled = enabled
+
+    def _fmt(self, code, text):
+        if self.enabled:
+            return '\x1b[%dm%s\x1b[0m' % (code, text)
+        return text
+
+    def bold(self, text):
+        return self._fmt(1, text)
+
+    def black(self, text):
+        return self._fmt(30, text)
+
+    def red(self, text):
+        return self._fmt(31, text)
+
+    def green(self, text):
+        return self._fmt(32, text)
+
+    def yellow(self, text):
+        return self._fmt(33, text)
+
+    def blue(self, text):
+        return self._fmt(34, text)
+
+    def magenta(self, text):
+        return self._fmt(35, text)
+
+    def cyan(self, text):
+        return self._fmt(36, text)
+
+    def white(self, text):
+        return self._fmt(37, text)
+
+
+def _import(mod_name):
+    if isinstance(mod_name, tuple):
+        mod = __import__('.'.join(mod_name[:-1]), fromlist=[mod_name[-1]])
+        return mod_name[-1], mod
+    return mod_name, __import__(mod_name)
+
+
+class Code(object):
+    def __init__(self, context, statements=None, functions=None, imports=None):
+        self._context = context
+        self._statements = statements or []
+        self._functions = functions or []
+        self._imports = set(imports or [])
+
+    def _infer_imports(self, tree):
+        for node in ast.walk(tree):
+            try_mod = _climb_attrs(node)
+            if try_mod:
+                try:
+                    __import__('.'.join(try_mod))
+                    self._imports.add('.'.join(try_mod))
+                except ImportError:
+                    continue
+
+    def imports(self, *imports):
+        for i in imports:
+            mod_name = '.'.join(i) if isinstance(i, tuple) else i
+            try:
+                _import(i)
+            except ImportError:
+                raise Unsupported('no module {}'.format(mod_name))
+
+        self._imports.update(imports)
+        return self
+
+    def statement(self, _stmt, **args):
+        self._infer_imports(ast.parse(_stmt))
+        for a in args.values():
+            if a is not None:
+                self._infer_imports(ast.parse(a))
+
+        _stmt = _stmt.format(
+            _func=self._context.current_func,
+            _last=self._context.current_var, **args).strip()
+
+        if self._context.strict_checks:
+            ast.parse(_stmt)
+        self._statements.append((self._context.parsing, _stmt))
+        return self
+
+    def function(self, definition, **args):
+        func = textwrap.dedent(definition.format(
+            _func=self._context.next_func(),
+            _last=self._context.current_var, **args)).strip()
+
+        self._infer_imports(ast.parse(func))
+        self._functions.append((self._context.parsing, func))
+        return self
+
+    def assign(self, _expr, **args):
+        self._infer_imports(ast.parse(_expr))
+        for a in args.values():
+            if a is not None:
+                self._infer_imports(ast.parse(a))
+
+        next_var, last_var = self._context.next_vars()
+        stmt = (next_var + ' = ' + _expr.strip()).format(
+            _func=self._context.current_func,
+            _last=last_var, **args)
+
+        if self._context.strict_checks:
+            ast.parse(stmt)
+        self._statements.append((self._context.parsing, stmt))
+        return self
+
+
+class Context(object):
+    def __init__(self):
+        self.num_vars = 0
+        self.num_funcs = 0
+        self.parsing = None
+        self.strict_checks = False
+
+    @property
+    def current_func(self):
+        return '_f_%03d' % self.num_funcs
+
+    def next_func(self):
+        self.num_funcs += 1
+        func = self.current_func
+        return func
+
+    @property
+    def current_var(self):
+        return '_v_%03d' % self.num_vars
+
+    def next_vars(self):
+        last_var = self.current_var
+        self.num_vars += 1
+        next_var = self.current_var
+        return next_var, last_var
+
+    @contextmanager
+    def __call__(self, command, args):
+        self.parsing = (command, args)
+        yield
+        self.parsing = None
+
+
+def _commands(command_defs):
+    commands = {}
+    for key, val in command_defs.items():
+        if key.startswith('_do_') and inspect.isfunction(val):
+            commands[key[len('_do_'):]] = val
+    return commands
+
+
+def _grouped_commands(command_defs):
+    commands = {}
+    for key, val in command_defs.items():
+        if key.startswith('_do_') and inspect.isfunction(val):
+            docs = inspect.getdoc(val)
+            spec = inspect.getargspec(val)
+            match = re.search('Group: (.*)', docs)
+            group = match.group(1) if match else 'ungrouped'
+            commands[key[len('_do_'):]] = (
+                group, val, (spec.args[1:], spec.defaults))
+    return commands
+
+
+def _do_sh(context, command):
+    """
+    Run a shell command, replacing {} with the input line.
+
+    Group: shell
+    """
+    return Code(context).imports('pipes', 'subprocess').assign(
+        ('(subprocess.check_output({command}.format(pipes.quote(_)), '
+         'shell=True) for _ in {_last})'),
+        command=repr(command))
+
+
+def _do_delay(context, amount):
+    """
+    Pass each line through, waiting a certain amount.
+
+    (See --line-buffered.)
+
+    Group: streams
+    """
+    return Code(context).imports('time').assign(
+        '(time.sleep({amount}) or _ for _ in {_last})', amount=amount)
+
+
+def _do_min(context, expr):
+    """
+    Returns the minimum value of the expression over all input lines.
+
+    Group: aggregates
+    """
+    return Code(context).assign(
+        '(min({_last}, key=lambda _: ({expr})))', expr=expr)
+
+
+def _do_max(context, expr):
+    """
+    Returns the maximum value of the expression over all input lines.
+
+    Group: aggregates
+    """
+    return Code(context).assign(
+        '(max({_last}, key=lambda _: ({expr})))', expr=expr)
+
+
+def _do_paths(context):
+    """
+    Returns each input line as a Path object.
+
+    Group: shell
+    """
+    return Code(context).imports('pathlib').assign(
+        '(pathlib.Path(_) for _ in {_last})')
+
+
+def _do_format(context, fmt):
+    """
+    Formats each input line using a format string.
+
+    Group: formats
+    """
+    return Code(context).assign(
+        '({fmt} % tuple(v) for v in {_last})',
+        fmt=repr(fmt))
+
+
+def _do_const(context, value):
+    """
+    Replaces the stream with a scalar value.
+
+    Group: streams
+    """
+    return Code(context).assign('{value}', value=value)
+
+
+def _do_next(context):
+    """
+    Discards everything after the next value in the stream.
+
+    Group: streams
+    """
+    return Code(context).assign('next({_last})')
+
+
+def _do_skip(context, num=1):
+    """
+    Skips the next n input lines.
+
+    Group: streams
+    """
+    return Code(context).imports('itertools').assign(
+        'itertools.islice({_last}, {num}, None)', num=num)
+
+
+def _do_from_csv(context):
+    """
+    Parses input lines as CSV, generating lists.
+
+    Group: formats
+    """
+    return Code(context).imports('csv').assign(
+        'csv.reader({_last})')
+
+
+def _do_to_csv(context):
+    """
+    Converts lists back to CSV, quoted as needed.
+
+    Group: formats
+    """
+    func_def = """
+    def {_func}(input_iter):
+        buf = io.BytesIO()
+        writer = csv.writer(buf)
+        for item in input_iter:
+            writer.writerow(item)
+            buf.seek(0)
+            for line in buf:
+                yield line.strip()
+            buf.truncate(0)
+    """
+    return Code(context).imports('io', 'csv').function(func_def).assign(
+        '{_func}({_last})')
+
+
+def _do_read_json(context):
+    """
+    Reads stdin as JSON, generates paths + values.
+
+    Group: formats
+    """
+    return Code(context).imports('json', 'sys').assign(
+        'json_walk(json.load(sys.stdin))')
+
+
+def _do_write_json(context, indent=None):
+    """
+    Writes paths + values back to a JSON document.
+
+    Group: formats
+    """
+    return Code(context).imports('json').assign(
+        'json.dumps(json_unwalk({_last}), indent={indent})',
+        indent=indent)
+
+
+def _do_from_json(context):
+    """
+    Parses input lines as JSON, generating lists/dicts.
+
+    Group: formats
+    """
+    return Code(context).imports('json').assign(
+        '(json.loads(_) for _ in {_last})')
+
+
+def _do_to_json(context, indent=None):
+    """
+    Converts lists/dicts to JSON.
+
+    Group: formats
+    """
+    return Code(context).imports('json').assign(
+        '(json.dumps(_) for _ in {_last})', indent=indent)
+
+
+def _do_words(context):
+    """
+    Converts input lines to lists of words.
+
+    Group: text
+    """
+    return Code(context).imports('re') \
+        .statement("_words = re.compile(r'\s+')") \
+        .assign('(_words.split(_.strip()) for _ in {_last})')
+
+
+def _do_split(context, regexp=r'\s+'):
+    """
+    Splits input lines to lists from a pattern.
+
+    Group: text
+    """
+    return Code(context).imports('re') \
+        .statement("_pat = re.compile({regexp})", regexp=repr(regexp)) \
+        .assign('(_pat.split(_.strip()) for _ in {_last})')
+
+
+def _do_tokens(context):
+    """
+    Converts input lines to a stream of shell tokens.
+
+    Group: shell
+    """
+    return Code(context).imports('shlex').assign(
+        '(token for _line in {_last} for token in shlex.shlex(_line))')
+
+
+def _do_to_int(context):
+    """
+    Converts input lines to integers.
+
+    Group: formats
+    """
+    return Code(context).assign('(int(_) for _ in {_last})')
+
+
+def _do_to_float(context):
+    """
+    Converts input lines to floats.
+
+    Group: formats
+    """
+    return Code(context).assign('(float(_) for _ in {_last})')
+
+
+def _do_sum(context):
+    """
+    Sums input lines, producing a single scalar value.
+
+    Group: aggregates
+    """
+    return Code(context).assign('sum({_last})')
+
+
+def _do_avg(context):
+    """
+    Averages input lines, producing a single scalar value.
+
+    Group: aggregates
+    """
+    return Code(context).statement('_last = list({_last})').assign(
+        'sum(_last) / float(len(_last))')
+
+
+def _do_percentile(context, pct='50'):
+    """
+    Computes the percentile of sorted inputs, producing a single scalar value.
+
+    Group: aggregates
+    """
+    return Code(context).assign('percentile({_last}, {pct})', pct=pct)
+
+
+def _do_join(context, sep=' '):
+    """
+    Joins inputs using a separator character.
+
+    Group: text
+    """
+    return Code(context).assign('{sep}.join({_last})', sep=repr(sep))
+
+
+def _do_enumerate(context):
+    """
+    Produces pairs of (item number, item).
+
+    Group: streams
+    """
+    return Code(context).assign('enumerate({_last})')
+
+
+def _do_every(context, count, stmt):
+    """
+    Every n lines, runs a statement.
+
+    Group: streams
+    """
+    func_def = """
+        def {_func}(_seq):
+            for _count, _ in enumerate(_seq):
+                if _count % {count} == 0:
+                    {stmt}
+                yield _
+        """
+    return Code(context).function(func_def, stmt=stmt, count=count) \
+        .assign('{_func}({_last})')
+
+
+def _do_whenever(context, expr, stmt):
+    """
+    Whenever an expression is true, runs a statement.
+
+    Group: streams
+    """
+    func_def = """
+        def {_func}(_seq):
+            for _count, _ in enumerate(_seq):
+                if {expr}:
+                    {stmt}
+                yield _
+        """
+    return Code(context).function(func_def, stmt=stmt, expr=expr) \
+        .assign('{_func}({_last})')
+
+
+def _do_mapf(context, expr):
+    """
+    Transforms input lines using a named function.
+
+    Group: functional
+    """
+    return Code(context).assign('iter(map(({expr}), {_last}))', expr=expr)
+
+
+def _do_map(context, expr):
+    """
+    Transforms input lines using an expression.
+
+    Group: functional
+    """
+    return Code(context).assign('(({expr}) for _ in ({_last}))', expr=expr)
+
+
+def _do_pmapf(context, expr, size=None):
+    """
+    Transforms input lines using a named function, in parallel.
+
+    Group: functional
+    """
+    return Code(context).imports('multiprocessing').assign(
+        'multiprocessing.Pool({size}).imap_unordered({expr}, {_last})',
+        size=size)
+
+
+def _do_pmap(context, expr, size=None):
+    """
+    Transforms input lines using an expression, in parallel.
+
+    Group: functional
+    """
+    func_def = """
+        def {_func}(_):
+            return {expr}
+        """
+
+    return Code(context).imports('multiprocessing') \
+        .function(func_def, expr=expr).assign(
+            'multiprocessing.Pool({size}).imap_unordered({_func}, {_last})',
+            size=size)
+
+
+def _do_reduce(context, expr, initial=None):
+    """
+    Reduces input lines using an expression and optional initial value.
+
+    Group: functional
+    """
+    return Code(context).imports('functools').assign(
+        'functools.reduce((lambda _1, _2: ({expr})), {_last}, {initial})',
+        expr=expr, initial=initial)
+
+
+def _do_reducef(context, expr, initial=None):
+    """
+    Reduces input lines using a named function and optional initial value.
+
+    Group: functional
+    """
+    return Code(context).imports('functools').assign(
+        'functools.reduce(({expr}), {_last}, {initial})',
+        expr=expr, initial=initial)
+
+
+def _do_filter(context, expr):
+    """
+    Suppresses items for which the expression does not evaluate to True.
+
+    Group: filtering
+    """
+    return Code(context).assign(
+        '(_ for _ in {_last} if ({expr}))',
+        expr=expr)
+
+
+def _do_filterf(context, func):
+    """
+    Suppresses items for which the named function does not evaluate to True.
+
+    Group: filtering
+    """
+    return Code(context).assign('filter({_last}, {func})', func=func)
+
+
+def _do_reverse(context):
+    """
+    Produces the items in reverse order.
+
+    Group: ordering
+    """
+    return Code(context).assign('reversed(list({_last}))')
+
+
+def _do_sortby(context, expr):
+    """
+    Sorts all items by the value produced by `expr`.
+
+    Group: ordering
+    """
+    return Code(context).assign(
+        'sorted({_last}, key=(lambda _: ({expr})))',
+        expr=expr)
+
+
+def _do_groupby(context, expr):
+    """
+    Groups the input lines by an expression.
+
+    Group: ordering
+    """
+    return Code(context).imports('itertools').assign(
+        'itertools.groupby({_last}, (lambda _: ({expr})))',
+        expr=expr)
+
+
+def _do_dropwhile(context, expr):
+    """
+    Skips items as long as `expr` evaluates to True.
+
+    Group: filtering
+    """
+    return Code(context).imports('itertools').assign(
+        'itertools.dropwhile((lambda _: ({expr})), {_last})',
+        expr=expr)
+
+
+def _do_takewhile(context, expr):
+    """
+    Produces items as long as `expr` evaluates to True.
+
+    Group: filtering
+    """
+    return Code(context).imports('itertools').assign(
+        'itertools.takewhile((lambda _: ({expr})), {_last})',
+        expr=expr)
+
+
+def _do_expand(context, expr):
+    """
+    Nested loops: generates each sub-item resulting from `expr`.
+
+    Group: streams
+    """
+    return Code(context).assign(
+        '(_item for _ in {_last} for _item in ({expr}))',
+        expr=expr)
+
+
+def _do_iterate(context, expr):
+    """
+    Runs the expression repeatedly on a scalar or generator.
+
+    Group: streams
+    """
+    func_expr = """
+        def {_func}(_):
+            return ({expr})
+        """
+    func_iter = """
+        def {_func}(_):
+            _last = _
+            while True:
+                yield _last
+                _last = {func_expr}(_last)
+        """
+
+    return Code(context).function(func_expr, expr=expr) \
+        .function(func_iter, func_expr=context.current_func) \
+        .assign('{_func}({_last})')
+
+
+def _do_sample(context, total):
+    """
+    Chooses a sample of the input lines, uniformly.
+
+    Group: streams
+    """
+    func_def = """
+        def {_func}(total, _):
+            _r = random.randint
+            _v = []
+            for _count, _item in enumerate(_):
+                if _count < total:
+                    _v.append(_item)
+                else:
+                    _j = _r(0, _count)
+                    if _j < total:
+                        _v[_j] = _item
+            return iter(_v)
+        """
+    return Code(context).imports('random').function(func_def).assign(
+        '{_func}({total}, ({_last}))', total=total)
+
+
+def _do_to_date(context, fmt='%Y-%m-%dT%H:%M:%S%z'):
+    """
+    Converts strings to dates using an optional format.
+
+    Group: formats
+    """
+    return Code(context).imports('datetime').assign(
+        '(datetime.datetime.strptime(_, {fmt}) for _ in {_last})',
+        fmt=repr(fmt))
+
+
+def _do_from_date(context, fmt='%Y-%m-%dT%H:%M:%S%z'):
+    """
+    Converts dates to strings using an optional format.
+
+    Group: formats
+    """
+    return Code(context).imports('datetime').assign(
+        '(_.strftime({fmt}) for _ in {_last})',
+        fmt=repr(fmt))
+
+
+def parse_calls(commands, args):
+    all_calls = []
+    current_call = []
+
+    for arg in args:
+        if current_call and arg in commands:
+            all_calls.append(list(current_call))
+            current_call = []
+
+        if arg in commands:
+            current_call.append(commands[arg])
+        elif current_call:
+            current_call.append(arg)
+        else:
+            raise Exception('no definition for %s' % arg)
+
+    if current_call:
+        all_calls.append(list(current_call))
+
+    return all_calls
+
+
+def generate_code(context, imports, global_vars, functions, statements,
+                  no_print=False):
+    line_map = {}
+
+    src = StringIO()
+
+    print('from __future__ import print_function', file=src)
+    print('from operator import *', file=src)
+    for i in sorted(imports):
+        if isinstance(i, basestring):
+            print('import %s' % i, file=src)
+        else:
+            print('from %s import %s' % ('.'.join(i[:-1]), i[-1]), file=src)
+
+    for name, val in global_vars or []:
+        print('%s = %s' % (name, val), file=src)
+
+    for _, function in functions:
+        print(function, file=src)
+
+    lines = src.getvalue().count('\n')
+    for command, statement in statements:
+        print(statement, file=src)
+        lines += 1
+        line_map[lines] = (command, statement)
+
+    if no_print:
+        print(textwrap.dedent("""
+            try:
+                if hasattr({0}, "__iter__"):
+                    for _ in {0}:
+                        pass
+            except IOError as e:
+                if e.errno != 32: raise
+            """.format(context.current_var)).strip(),
+            file=src)
+    else:
+        print(textwrap.dedent("""
+            try:
+                if hasattr({0}, "__iter__"):
+                    for _ in {0}:
+                        print(_)
+                        {1}
+                else:
+                    print({0})
+                    {1}
+            except IOError as e:
+                if e.errno != 32: raise
+        """.format(
+            context.current_var,
+            'sys.stdout.flush()' if args.line_buffered else '')).strip(),
+            file=src)
+    return line_map, src.getvalue()
+
+
+def _generate_list(term, commands):
+    for command, func in sorted(commands.items()):
+        print(term.bold('%15s: ' % command), end='')
+        doc = inspect.getdoc(func) or '...'
+        print(inspect.cleandoc(doc).split('\n\n')[0].replace('\n', ' '))
+
+
+def _format_args((args, defaults)):
+    req_args = args[:-len(defaults) if defaults else None]
+    opt_args = args[-len(defaults):] if defaults else []
+    all_args = req_args + ['%s=%r' % item
+                           for item in zip(opt_args, defaults or [])]
+    return ', '.join(all_args)
+
+
+def _generate_grouped_list(term, commands):
+    _sort = lambda (c, (g, f, a)): (g, c)
+    _group = lambda (c, (g, f, a)): g
+    groups = itertools.groupby(sorted(commands.items(), key=_sort), key=_group)
+    for i, (group, commands) in enumerate(groups):
+        if i > 0:
+            print()
+        print(term.bold(term.green(group.capitalize())))
+        for command, (_, func, args) in commands:
+            print(term.bold('%15s:' % command), end=' ')
+            arg_fmt = _format_args(args)
+            print(term.cyan('[%s]' % arg_fmt), end=' ')
+            doc = inspect.getdoc(func) or '...'
+            print(inspect.cleandoc(doc).split('\n\n')[0].replace('\n', ' '))
+
+
+def _syntax_error(term, command_name, command_args, e):
+    print(term.red('Syntax error in "%s %s": %s\n' % (
+        command_name, ' '.join(command_args), e.msg)))
+    print('  ', e.text)
+    print(' ' * (2 + e.offset) + '^')
+    return 1
+
+
+def _argument_error(term, command_name, command_args, func, e):
+    if not str(e).startswith('_do_'):
+        raise
+    argspec = inspect.getargspec(func)
+    num_args = len(argspec.args) - 1
+    arg_desc = str(num_args)
+    if argspec.defaults:
+        arg_desc += '-%d' % (num_args + len(argspec.defaults))
+
+    print(term.red(
+        'Compilation error: %s needs %s argument%s, got %d' % (
+            command_name, arg_desc,
+            's' if arg_desc != '1' else '', len(command_args))))
+    return 2
+
+
+def _runtime_error(term, line_map, e):
+    tb_entries = traceback.extract_tb(sys.exc_traceback)
+    line_nums = [num for filename, num, _, _ in tb_entries
+                 if filename == EXEC_AS_FILENAME]
+    if not line_nums or line_nums[0] not in line_map:
+        print(term.red('Runtime error:'))
+        traceback.print_exc()
+        return
+
+    (command, args), _ = line_map[line_nums[0]]
+    description = command
+    if args:
+        description += ' ' + ' '.join(repr(arg) for arg in args)
+
+    print(term.red('Runtime error: %s (in "%s")' % (e, description)))
+    return 3
+
+
+def main(args, rest):
+    # Reexec based on options, if necessary.
+    if args.py2 and (not PY2 or PYPY):
+        os.execvp('python2', ['python2'] + sys.argv)
+    elif args.py3 and (PY2 or PYPY):
+        os.execvp('python3', ['python3'] + sys.argv)
+    elif args.pypy and not PYPY:
+        os.execvp('pypy', ['pypy'] + sys.argv)
+
+    term = Terminal(sys.stdout.isatty())
+    commands = _commands(globals())
+
+    if args.list:
+        _generate_list(term, commands)
+        return 0
+    elif args.list_grouped:
+        _generate_grouped_list(term, _grouped_commands(globals()))
+        return 0
+
+    calls = parse_calls(commands, rest)
+
+    context = Context()
+    all_imports = set(['sys', 'os'])
+    all_functions = []
+    all_statements = []
+
+    init = '%s = (_.rstrip() for _ in sys.stdin)' % context.current_var
+    all_statements.append((None, init))
+
+    for call in calls:
+        func = call[0]
+        command_name = call[0].__name__[len('_do_'):]
+        command_args = call[1:]
+        try:
+            with context(command_name, command_args):
+                code = func(context, *command_args)
+        except SyntaxError as e:
+            return _syntax_error(term, command_name, command_args, e)
+        except TypeError as e:
+            return _argument_error(term, command_name, command_args, func, e)
+
+        all_imports.update(code._imports)
+        all_functions.extend(code._functions)
+        all_statements.extend(code._statements)
+
+    line_map, src = generate_code(context, all_imports, args.initial_vars,
+                                  all_functions, all_statements,
+                                  no_print=args.no_print)
+
+    if args.source:
+        print(src)
+        return 0
+    elif args.debug:
+        print(src, file=sys.stderr)
+
+    exec_globals = dict(Term=Terminal(sys.stdout.isatty()),
+                        json_walk=json_walk,
+                        json_unwalk=json_unwalk,
+                        percentile=percentile)
+
+    try:
+        if PY2:
+            exec("exec compile(src, EXEC_AS_FILENAME, 'exec') in exec_globals")
+        else:
+            exec(compile(src, EXEC_AS_FILENAME, 'exec'), exec_globals)
+
+    except Exception as e:
+        return _runtime_error(term, line_map, e)
+    except KeyboardInterrupt:
+        print(term.red('Cancelled by user, exiting'))
+        return 4
+
+
+def _parse_args():
+    parser = ArgumentParser()
+    parser.add_argument('-2', dest='py2', action='store_true')
+    parser.add_argument('-3', dest='py3', action='store_true')
+    parser.add_argument('-o', dest='pypy', action='store_true')
+    parser.add_argument('-n', '--no-print', action='store_true')
+    parser.add_argument('-L', '--line-buffered', action='store_true')
+    parser.add_argument('-l', '--list', action='store_true')
+    parser.add_argument('-a' '--assign', action='append', dest='initial_vars',
+                        type=lambda i: i.split('=', 1))
+    parser.add_argument('--list-grouped', action='store_true')
+    parser.add_argument('-s', '--source', action='store_true')
+    parser.add_argument('-d', '--debug', action='store_true')
+    return parser.parse_known_args()
+
+
+if __name__ == '__main__':
+    args, rest = _parse_args()
+    result = main(args, rest)
+    sys.exit(result or 0)
