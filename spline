@@ -804,6 +804,7 @@ def generate_code(context, imports, global_vars, functions, statements,
 
     print('from __future__ import print_function', file=src)
     print('from operator import *', file=src)
+    print('from datetime import *', file=src)
     for i in sorted(imports):
         if isinstance(i, basestring):
             print('import %s' % i, file=src)
@@ -851,13 +852,6 @@ def generate_code(context, imports, global_vars, functions, statements,
     return line_map, src.getvalue()
 
 
-def _generate_list(term, commands):
-    for command, func in sorted(commands.items()):
-        print(term.bold('%15s: ' % command), end='')
-        doc = inspect.getdoc(func) or '...'
-        print(inspect.cleandoc(doc).split('\n\n')[0].replace('\n', ' '))
-
-
 def _format_args((args, defaults)):
     req_args = args[:-len(defaults) if defaults else None]
     opt_args = args[-len(defaults):] if defaults else []
@@ -884,7 +878,7 @@ def _generate_grouped_list(term, commands):
 
 def _syntax_error(term, command_name, command_args, e):
     print(term.red('Syntax error in "%s %s": %s\n' % (
-        command_name, ' '.join(command_args), e.msg)))
+        command_name, ' '.join(command_args), e.msg)), file=sys.stderr)
     print('  ', e.text)
     print(' ' * (2 + e.offset) + '^')
     return 1
@@ -900,9 +894,10 @@ def _argument_error(term, command_name, command_args, func, e):
         arg_desc += '-%d' % (num_args + len(argspec.defaults))
 
     print(term.red(
-        'Compilation error: %s needs %s argument%s, got %d' % (
-            command_name, arg_desc,
-            's' if arg_desc != '1' else '', len(command_args))))
+          'Compilation error: %s needs %s argument%s, got %d' % (
+              command_name, arg_desc,
+              's' if arg_desc != '1' else '', len(command_args))),
+          file=sys.stderr)
     return 2
 
 
@@ -911,7 +906,7 @@ def _runtime_error(term, line_map, e):
     line_nums = [num for filename, num, _, _ in tb_entries
                  if filename == EXEC_AS_FILENAME]
     if not line_nums or line_nums[0] not in line_map:
-        print(term.red('Runtime error:'))
+        print(term.red('Runtime error:'), file=sys.stderr)
         traceback.print_exc()
         return
 
@@ -920,7 +915,8 @@ def _runtime_error(term, line_map, e):
     if args:
         description += ' ' + ' '.join(repr(arg) for arg in args)
 
-    print(term.red('Runtime error: %s (in "%s")' % (e, description)))
+    print(term.red('Runtime error: %s (in "%s")' % (e, description)),
+          file=sys.stderr)
     return 3
 
 
@@ -937,9 +933,6 @@ def main(args, rest):
     commands = _commands(globals())
 
     if args.list:
-        _generate_list(term, commands)
-        return 0
-    elif args.list_grouped:
         _generate_grouped_list(term, _grouped_commands(globals()))
         return 0
 
@@ -976,8 +969,6 @@ def main(args, rest):
     if args.source:
         print(src)
         return 0
-    elif args.debug:
-        print(src, file=sys.stderr)
 
     exec_globals = dict(Term=Terminal(sys.stdout.isatty()),
                         json_walk=json_walk,
@@ -993,23 +984,30 @@ def main(args, rest):
     except Exception as e:
         return _runtime_error(term, line_map, e)
     except KeyboardInterrupt:
-        print(term.red('Cancelled by user, exiting'))
+        print(term.red('Cancelled by user, exiting'), file=sys.stderr)
         return 4
 
 
 def _parse_args():
     parser = ArgumentParser()
-    parser.add_argument('-2', dest='py2', action='store_true')
-    parser.add_argument('-3', dest='py3', action='store_true')
-    parser.add_argument('-o', dest='pypy', action='store_true')
-    parser.add_argument('-n', '--no-print', action='store_true')
-    parser.add_argument('-L', '--line-buffered', action='store_true')
-    parser.add_argument('-l', '--list', action='store_true')
-    parser.add_argument('-a' '--assign', action='append', dest='initial_vars',
-                        type=lambda i: i.split('=', 1))
-    parser.add_argument('--list-grouped', action='store_true')
-    parser.add_argument('-s', '--source', action='store_true')
-    parser.add_argument('-d', '--debug', action='store_true')
+    parser.add_argument('-2', dest='py2', action='store_true',
+                        help='run using Python 2')
+    parser.add_argument('-3', dest='py3', action='store_true',
+                        help='run using Python 3')
+    parser.add_argument('-o', dest='pypy', action='store_true',
+                        help='run using Pypy ("optimized")')
+    parser.add_argument('-n', '--no-print', action='store_true',
+                        help=("don't automatically print "
+                              "final generator output"))
+    parser.add_argument('-L', '--line-buffered', action='store_true',
+                        help='flush stdout after printing each output line')
+    parser.add_argument('-l', '--list', action='store_true',
+                        help='print the list of available commands')
+    parser.add_argument('-a', '--assign', action='append', dest='initial_vars',
+                        metavar='VAR=VALUE', type=lambda i: i.split('=', 1),
+                        help='assign a value to a global variable')
+    parser.add_argument('-s', '--source', action='store_true',
+                        help='print the generated Python code')
     return parser.parse_known_args()
 
 
