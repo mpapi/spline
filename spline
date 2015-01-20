@@ -796,6 +796,10 @@ def parse_calls(commands, args):
     return all_calls
 
 
+def _is_string(i):
+    return isinstance(i, basestring if PY2 else str)
+
+
 def generate_code(context, imports, global_vars, functions, statements,
                   no_print=False):
     line_map = {}
@@ -806,7 +810,7 @@ def generate_code(context, imports, global_vars, functions, statements,
     print('from operator import *', file=src)
     print('from datetime import *', file=src)
     for i in sorted(imports):
-        if isinstance(i, basestring):
+        if _is_string(i):
             print('import %s' % i, file=src)
         else:
             print('from %s import %s' % ('.'.join(i[:-1]), i[-1]), file=src)
@@ -852,7 +856,8 @@ def generate_code(context, imports, global_vars, functions, statements,
     return line_map, src.getvalue()
 
 
-def _format_args((args, defaults)):
+def _format_args(func_args):
+    args, defaults = func_args
     req_args = args[:-len(defaults) if defaults else None]
     opt_args = args[-len(defaults):] if defaults else []
     all_args = req_args + ['%s=%r' % item
@@ -861,8 +866,8 @@ def _format_args((args, defaults)):
 
 
 def _generate_grouped_list(term, commands):
-    _sort = lambda (c, (g, f, a)): (g, c)
-    _group = lambda (c, (g, f, a)): g
+    _sort = lambda cmd: (cmd[1][0], cmd[0])
+    _group = lambda cmd: cmd[1][0]
     groups = itertools.groupby(sorted(commands.items(), key=_sort), key=_group)
     for i, (group, commands) in enumerate(groups):
         if i > 0:
