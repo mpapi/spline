@@ -37,6 +37,14 @@ class Unsupported(Exception):
     pass
 
 
+class NoDefinition(Exception):
+    """
+    An exception type raised when no definition for a command could be found
+    when parsing the list of commands and args to run.
+    """
+    pass
+
+
 def _climb_attrs(node):
     if isinstance(node, ast.Attribute):
         parent = _climb_attrs(node.value)
@@ -788,7 +796,7 @@ def parse_calls(commands, args):
         elif current_call:
             current_call.append(arg)
         else:
-            raise Exception('no definition for %s' % arg)
+            raise NoDefinition(arg)
 
     if current_call:
         all_calls.append(list(current_call))
@@ -801,7 +809,7 @@ def _is_string(i):
 
 
 def generate_code(context, imports, global_vars, functions, statements,
-                  no_print=False):
+                  no_print=False, line_buffered=False):
     line_map = {}
 
     src = StringIO()
@@ -851,7 +859,7 @@ def generate_code(context, imports, global_vars, functions, statements,
                 if e.errno != 32: raise
         """.format(
             context.current_var,
-            'sys.stdout.flush()' if args.line_buffered else '')).strip(),
+            'sys.stdout.flush()' if line_buffered else '')).strip(),
             file=src)
     return line_map, src.getvalue()
 
@@ -879,6 +887,11 @@ def _generate_grouped_list(term, commands):
             print(term.cyan('[%s]' % arg_fmt), end=' ')
             doc = inspect.getdoc(func) or '...'
             print(inspect.cleandoc(doc).split('\n\n')[0].replace('\n', ' '))
+
+
+def _no_such_command_error(term, e):
+    print(term.red('No such command: %s' % e))
+    return 4
 
 
 def _syntax_error(term, command_name, command_args, e):
@@ -925,7 +938,7 @@ def _runtime_error(term, line_map, e):
     return 3
 
 
-def main(args, rest):
+def main(args):
     # Reexec based on options, if necessary.
     if args.py2 and (not PY2 or PYPY):
         os.execvp('python2', ['python2'] + sys.argv)
@@ -941,7 +954,10 @@ def main(args, rest):
         _generate_grouped_list(term, _grouped_commands(globals()))
         return 0
 
-    calls = parse_calls(commands, rest)
+    try:
+        calls = parse_calls(commands, args.expressions)
+    except NoDefinition as e:
+        return _no_such_command_error(term, e)
 
     context = Context()
     all_imports = set(['sys', 'os'])
@@ -969,7 +985,8 @@ def main(args, rest):
 
     line_map, src = generate_code(context, all_imports, args.initial_vars,
                                   all_functions, all_statements,
-                                  no_print=args.no_print)
+                                  no_print=args.no_print,
+                                  line_buffered=args.line_buffered)
 
     if args.source:
         print(src)
@@ -990,7 +1007,7 @@ def main(args, rest):
         return _runtime_error(term, line_map, e)
     except KeyboardInterrupt:
         print(term.red('Cancelled by user, exiting'), file=sys.stderr)
-        return 4
+        return 5
 
 
 def _parse_args():
@@ -1013,10 +1030,10 @@ def _parse_args():
                         help='assign a value to a global variable')
     parser.add_argument('-s', '--source', action='store_true',
                         help='print the generated Python code')
-    return parser.parse_known_args()
+    parser.add_argument('expressions', type=str, nargs='+')
+    return parser.parse_args()
 
 
 if __name__ == '__main__':
-    args, rest = _parse_args()
-    result = main(args, rest)
+    result = main(_parse_args())
     sys.exit(result or 0)
