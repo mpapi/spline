@@ -267,6 +267,20 @@ def _grouped_commands(command_defs):
     return commands
 
 
+# TODO library of commands
+
+
+def _do_html_select(context, selector):
+    """
+    Parse HTML from stdin, return elements matching the selector.
+
+    Group: lxml
+    """
+    return Code(context).imports('lxml.html').assign(
+        '(elt for elt in lxml.html.parse(sys.stdin).getroot().cssselect({selector}))',
+        selector=repr(selector))
+
+
 def _do_sh(context, command):
     """
     Run a shell command, replacing {} with the input line.
@@ -385,7 +399,8 @@ def _do_to_csv(context):
             buf.seek(0)
             for line in buf:
                 yield line.strip()
-            buf.truncate(0)
+            buf.seek(0)
+            buf.truncate()
     """
     return Code(context).imports('io', 'csv').function(func_def).assign(
         '{_func}({_last})')
